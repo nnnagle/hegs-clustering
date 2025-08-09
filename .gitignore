@@ -1,0 +1,27 @@
+# R
+.Rhistory
+.Rproj.user/
+.RData
+.Ruserdata
+renv/library/
+.Rprofile
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.ipynb_checkpoints/
+
+# Data/models
+data/raw/
+data/interim/
+models/
+outputs/embeddings/
+outputs/logs/
+outputs/eval/
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+
