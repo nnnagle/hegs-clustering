@@ -4,7 +4,7 @@ Cluster HEGS portfolio with fine-tuned sentence transformers
 
 ## Contents
 - `R/05_HEGS_clean.R` Cleain the HEGS abstracts
-- `R/10_keyword_candidates.R` Create keword candidates from noun_phrases and ocllocations
+- `R/10_keyword_candidates.R` Create keword candidates from noun_phrases and collocations
 - `R/15_sentence_transformer.R` Create embeddings
 - `R/16_train_split.R` Create training splits of keyword pairs using graph to avoid leakage
 - `R/20_tune_transformer.R` R portion of transformer tuning
@@ -14,6 +14,5 @@ Cluster HEGS portfolio with fine-tuned sentence transformers
 - `python/30_encode_corpus.py`
 - `python/35_cluster.py`
 
-## Data (not committed)
+## Data
 - `data/raw/HEGS_awards.csv` 
-- 

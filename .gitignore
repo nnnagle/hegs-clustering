@@ -14,7 +14,6 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Data/models
-data/raw/
 data/interim/
 models/
 outputs/embeddings/

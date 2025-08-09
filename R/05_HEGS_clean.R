@@ -43,7 +43,7 @@ suppressPackageStartupMessages({
 
 # Paths
 input_file   <- "data/raw/HEGS_awards.csv"
-output_file  <- "data/intermediate/HEGS_clean_df.csv"
+output_file  <- "data/interim/HEGS_clean_df.csv"
 
 # Sentences to strip from abstracts (escaped parens kept for regex safety)
 statutory_text <- c(
