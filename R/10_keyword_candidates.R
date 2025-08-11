@@ -190,6 +190,8 @@ collocs_clean <- colloc_model$collocation_stat %>%
 sw <- tolower(gsub("'", "", stopwords(language = stop_lang)))
 collocs_clean$term <- vapply(collocs_clean$term, trim_term, stopwords_vec = sw, FUN.VALUE = character(1))
 collocs_clean$term <- str_squish(collocs_clean$term)
+collocs_clean <- collocs_clean %>%
+  filter(term != '')
 
 # Map terms to award_ids via regex search over doc_texts
 logi("Mapping collocations back to documents...")
@@ -281,7 +283,6 @@ logi("Total unique phrases: %d", nrow(keyword_candidates))
 ## =============================
 
 ensure_dir(out_dir)
-
 # Convert award_ids list-column to a comma-separated string for CSV output
 keyword_candidates_out <- keyword_candidates %>%
   mutate(
@@ -289,11 +290,15 @@ keyword_candidates_out <- keyword_candidates %>%
       award_ids,
       function(ids) paste(ids, collapse = ","),
       FUN.VALUE = character(1)
-    )
-  )
+    ),
+    omit = as.logical(omit),
+    method=as.logical(method),
+    thematic=as.logical(method)
+  ) %>%
+  select(kid, everything())
 
 logi("Writing: %s", out_file)
-write_csv(keyword_candidates_out, out_file)
+write_csv(keyword_candidates_out, out_file, quote='all')
 
 logi("Done.")
 
