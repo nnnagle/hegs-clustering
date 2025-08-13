@@ -1,9 +1,10 @@
-# app.R — Shiny labeler with sparse co-occurrence & on-demand samplers
-# --------------------------------------------------------------------
+# app.R — Shiny labeler with sparse co-occurrence & on-demand samplers + abstract preview navigator
+# ----------------------------------------------------------------------------------------------
 # Data layout assumed:
-# - data/interim/keyword_candidates.csv    (kid, phrase, award_ids (comma string), omit/method/thematic logical)
-# - data/interim/keyword_embeddings.parquet (kid + dim_000 ... dim_767)
-# - kw_pairs.csv (optional; kw1, kw2, value) — appended as you label
+# - ../data/interim/keyword_candidates.csv     (kid, phrase, award_ids (comma string), omit/method/thematic logical)
+# - ../data/interim/keyword_embeddings.parquet (kid + dim_000 ... dim_767)
+# - ../data/interim/kw_pairs.csv (optional; kw1, kw2, value) — appended as you label
+# - ../data/interim/HEGS_clean_df.csv          (award_id, abstract)
 #
 # Samplers:
 # - Uses keyword_samplers.R with on-demand sampling (no combn()).
@@ -33,11 +34,36 @@ renorm <- function(M) {
   M / n
 }
 
+# Escape a phrase for regex, then wrap matches with <mark>
+highlight_phrase <- function(text, phrase) {
+  if (is.na(text) || is.na(phrase) || phrase == "") return(text)
+  # Use stringr::str_escape to treat the phrase literally; match case-insensitively
+  pat <- stringr::regex(stringr::str_escape(phrase), ignore_case = TRUE)
+  locs <- stringr::str_locate_all(text, pat)[[1]]
+  if (is.null(locs) || nrow(locs) == 0) return(text)
+  out <- character(0)
+  last <- 1L
+  for (i in seq_len(nrow(locs))) {
+    s <- locs[i,1]; e <- locs[i,2]
+    out <- c(out, substr(text, last, s - 1L), "<mark>", substr(text, s, e), "</mark>")
+    last <- e + 1L
+  }
+  out <- c(out, substr(text, last, nchar(text)))
+  paste0(out, collapse = "")
+}
+
+
 ui <- fluidPage(
   titlePanel("Keyword Pair Labeling Interface"),
+  tags$head(tags$style(HTML("
+    mark {
+      background-color: #008000 !important;
+      color: #fff;
+    }
+  "))),
   sidebarLayout(
     sidebarPanel(
-      width=3,
+      width = 3,
       h3("Sampling Options"),
       selectInput(
         "sampler", "Choose a sampler:",
@@ -67,10 +93,17 @@ ui <- fluidPage(
         numericInput("max_shared_docs", "Max shared docs:", value = 0, min = 0, step = 1)
       ),
       
-      actionButton("sample", "Sample Pairs")
+      actionButton("sample", "Sample Pairs"),
+      
+      div(style = "border-top: 2px solid #e5e7eb; margin-top: 18px; padding-top: 14px;",
+          h3("Abstract Preview"),
+          selectizeInput("kw_for_preview", "Select a keyword:", choices = NULL, selected = NULL,
+                         options = list(placeholder = "Type to search…")),
+          actionButton("preview_abs", "Show example abstract")
+      )
     ),
     mainPanel(
-      width=9,
+      width = 9,
       h3("Keyword Pairs to Label"),
       rHandsontableOutput("pair_table"),
       br(),
@@ -84,7 +117,7 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   # ----- Runtime state (scalars / matrices / frames) -----
-  keyword_candidates <- NULL  # full candidates (data/interim/keyword_candidates.csv)
+  keyword_candidates <- NULL  # full candidates (../data/interim/keyword_candidates.csv)
   kw_sub <- NULL              # active subset after filtering omit==TRUE
   emb_mat <- NULL             # all embeddings [rows keyed by kid]
   kw_sim <- NULL              # dense cosine for active subset
@@ -97,7 +130,17 @@ server <- function(input, output, session) {
   # Table to show for labeling
   sampled_df <- reactiveVal(NULL)
   
+  # Modal navigation state for abstract preview
+  modal_state <- reactiveValues(ids = character(0), idx = 1, kw = NULL)
+  
   # --------- Load data and initialize structures ----------
+  hegs_df <- tryCatch({
+    readr::read_csv("../data/interim/HEGS_clean_df.csv", show_col_types = FALSE) %>%
+      mutate(award_id = as.character(award_id))
+  }, error = function(e) {
+    tibble(award_id = character(0), abstract = character(0))
+  })
+  
   tryCatch({
     # 1) Candidates
     keyword_candidates <- readr::read_csv("../data/interim/keyword_candidates.csv", show_col_types = FALSE) %>%
@@ -177,6 +220,12 @@ server <- function(input, output, session) {
     } else {
       used_pair_keys(NULL)
     }
+    
+    # Populate keyword select for preview
+    updateSelectizeInput(session, "kw_for_preview",
+                         choices = kw_sub$phrase,
+                         selected = NULL,
+                         server = TRUE)
     
   }, error = function(e) {
     showModal(modalDialog(
@@ -292,8 +341,8 @@ server <- function(input, output, session) {
     
     # 2) Append labeled rows to kw_pairs.csv (only finite values)
     new_rows <- df_edit %>%
-      filter(is.finite(value)) %>%
-      transmute(kw1 = `keyword.1`, kw2 = `keyword.2`, value)
+      dplyr::filter(is.finite(value)) %>%
+      dplyr::transmute(kw1 = `keyword.1`, kw2 = `keyword.2`, value)
     if (nrow(new_rows)) {
       if (!file.exists(pairs_file)) {
         readr::write_csv(new_rows, pairs_file, quote='all')
@@ -351,10 +400,89 @@ server <- function(input, output, session) {
       X@x[] <- 1L
       C_new <- X %*% t(X); diag(C_new) <- 0
       C <<- drop0(C_new)
+      
+      # refresh preview select options
+      updateSelectizeInput(session, "kw_for_preview",
+                           choices = kw_sub$phrase,
+                           selected = NULL,
+                           server = TRUE)
     }
     
     showNotification("Saved.", type = "message")
   }
+  
+  # ------------------ Abstract preview modal ------------------
+  output$modal_title <- renderText({
+    req(length(modal_state$ids) >= 1, modal_state$kw, modal_state$idx)
+    cur_id <- modal_state$ids[modal_state$idx]
+    paste0("Award ", cur_id, " — ", modal_state$kw)
+  })
+  
+  output$abs_html <- renderUI({
+    req(length(modal_state$ids) >= 1, modal_state$idx)
+    cur_id <- modal_state$ids[modal_state$idx]
+    abs_row <- hegs_df %>%
+      dplyr::filter(.data$award_id == cur_id) %>%
+      dplyr::transmute(award_id,
+                       abstract = stringr::str_replace_all(abstract_clean, "-", " "))
+    if (!nrow(abs_row) || is.na(abs_row$abstract[1]) || !nzchar(abs_row$abstract[1])) {
+      return(HTML("<em>Abstract not found.</em>"))
+    }
+    HTML(highlight_phrase(abs_row$abstract[1], modal_state$kw))
+  })
+  
+  observeEvent(input$preview_abs, {
+    req(!is.null(kw_sub), !is.null(input$kw_for_preview), nrow(kw_sub) > 0)
+    row_idx <- which(kw_sub$phrase == input$kw_for_preview)
+    if (length(row_idx) != 1) {
+      showNotification("Keyword not found in active set.", type = "error"); return()
+    }
+    
+    # Use only award IDs that actually exist in HEGS file
+    ids <- kw_sub$award_ids[[row_idx]]
+    ids <- ids[!is.na(ids) & nzchar(ids)]
+    ids <- intersect(ids, hegs_df$award_id)
+    
+    if (!length(ids)) {
+      showNotification("No abstracts found for this keyword.", type = "warning"); return()
+    }
+    
+    # Initialize modal navigation state
+    modal_state$ids <- ids
+    modal_state$idx <- 1
+    modal_state$kw  <- input$kw_for_preview
+    
+    showModal(modalDialog(
+      title = textOutput("modal_title"),
+      easyClose = TRUE, size = "l",
+      footer = tagList(
+        actionButton("prev_abs", "← Prev"),
+        uiOutput("pos_indicator"),
+        actionButton("next_abs", "Next →"),
+        modalButton("Close")
+      ),
+      div(style = "max-height: 60vh; overflow-y: auto;",
+          htmlOutput("abs_html"))
+    ))
+  })
+  
+  # Position indicator
+  output$pos_indicator <- renderUI({
+    req(length(modal_state$ids) >= 1)
+    span(style = "margin: 0 10px;", paste0(modal_state$idx, " of ", length(modal_state$ids)))
+  })
+  
+  observeEvent(input$next_abs, {
+    req(length(modal_state$ids) >= 1)
+    n <- length(modal_state$ids)
+    modal_state$idx <- (modal_state$idx %% n) + 1  # wrap-around
+  })
+  
+  observeEvent(input$prev_abs, {
+    req(length(modal_state$ids) >= 1)
+    n <- length(modal_state$ids)
+    modal_state$idx <- ((modal_state$idx - 2) %% n) + 1  # wrap-around
+  })
 }
 
 shinyApp(ui, server)
