@@ -33,6 +33,80 @@ df_cv = df_all[df_all["fold"].isin(cv_folds)].copy()
 if df_cv.empty:
     raise ValueError("No rows found for folds 1–4 to run CV.")
 
+# --------------------------
+# Diagnostics (pre-training)
+# --------------------------
+import numpy as np
+from collections import Counter
+from transformers import AutoTokenizer
+
+# Use the same tokenizer family as the model
+tok = AutoTokenizer.from_pretrained("sentence-transformers/all-mpnet-base-v2")
+
+def _ntoks(s: str) -> int:
+    return len(tok.encode(str(s), add_special_tokens=False))
+
+print("\n=== DATA BALANCE DIAGNOSTICS ===")
+
+# 1) Size and label distribution per fold
+size_label = df_cv.groupby("fold").agg(
+    n=("value", "size"),
+    label_mean=("value", "mean"),
+    label_std=("value", "std"),
+)
+print("\n[Fold sizes & label moments]\n", size_label)
+
+# 2) Binned label histograms (proportions)
+bins = pd.IntervalIndex.from_tuples([(0, .2), (.2, .4), (.4, .6), (.6, .8), (.8, 1.0)], closed="right")
+df_cv["value_bin"] = pd.cut(df_cv["value"], bins)
+hist = pd.crosstab(df_cv["fold"], df_cv["value_bin"], normalize="index")
+print("\n[Label distribution by fold]\n", hist)
+
+# 3) Cross-fold leakage: same unordered pair across folds?
+pairs_unordered = df_cv.apply(lambda r: tuple(sorted((str(r.kw1), str(r.kw2)))), axis=1)
+dup_mask = pairs_unordered.duplicated(keep=False)
+leak = df_cv.loc[dup_mask].assign(pair=pairs_unordered[dup_mask]).groupby(["pair","fold"]).size().unstack(fill_value=0)
+leak_crossfold = leak[leak.gt(0).sum(axis=1) > 1]
+print("\n[Potential cross-fold duplicates]\n", leak_crossfold.head() if not leak_crossfold.empty else "None")
+
+print("\n=== TOKENIZER-LEVEL DIAGNOSTICS ===")
+
+# 4) Subword token length stats
+for col in ["kw1", "kw2"]:
+    df_cv[f"{col}_ntoks"] = df_cv[col].astype(str).apply(_ntoks)
+df_cv["pair_ntoks"] = df_cv["kw1_ntoks"] + df_cv["kw2_ntoks"]
+
+len_stats = df_cv.groupby("fold")[["kw1_ntoks","kw2_ntoks","pair_ntoks"]].describe()
+print("\n[Subword token stats by fold]\n", len_stats)
+
+thresh = 12  # tweak as needed
+long_share = df_cv.assign(is_long=lambda d: d["pair_ntoks"] > thresh) \
+                  .groupby("fold")["is_long"].mean()
+print(f"\n[Share of pairs with >{thresh} subword tokens by fold]\n", long_share)
+
+# 5) Rare-subword difficulty proxy: mean inverse token frequency in each fold's VAL set,
+#    with frequencies computed from that fold's TRAIN set (lower == easier).
+def _tokens_in_df(df):
+    for col in ["kw1","kw2"]:
+        for s in df[col].astype(str):
+            yield from tok.encode(s, add_special_tokens=False)
+
+def _mean_inverse_freq(val_df, freq_counter: Counter) -> float:
+    vals = []
+    for col in ["kw1","kw2"]:
+        for s in val_df[col].astype(str):
+            ids = tok.encode(s, add_special_tokens=False)
+            vals.extend([1.0 / max(1, freq_counter[i]) for i in ids])
+    return float(np.mean(vals)) if vals else 0.0
+
+print("\n[Rare-subword proxy: mean inverse token frequency (per-fold validation)]")
+for f in cv_folds:
+    train_df = df_cv[df_cv["fold"] != f]
+    val_df   = df_cv[df_cv["fold"] == f]
+    freq = Counter(_tokens_in_df(train_df))
+    mif = _mean_inverse_freq(val_df, freq)
+    print(f"  Fold {f}: {mif:.6f}")
+
 # Build per-fold data once to avoid recomputing inside trials
 def make_input_examples(df_subset: pd.DataFrame):
     return [
@@ -125,6 +199,17 @@ print("Best params:", study.best_params)
 print("Best mean CV Spearman (folds 1–4):", study.best_value)
 print("Best trial per-fold:", study.best_trial.user_attrs.get("fold_scores"))
 print("Best trial CV std:", study.best_trial.user_attrs.get("cv_std"))
+
+# Difficulty balance across all trials (is one fold consistently easiest/hardest?)
+fold_mat = np.array([t.user_attrs["fold_scores"] for t in study.trials if "fold_scores" in t.user_attrs])
+if fold_mat.size:
+    per_fold_mean = fold_mat.mean(0)
+    per_fold_std  = fold_mat.std(0, ddof=0)
+    print("\n[Per-fold difficulty across all trials]")
+    for i, (m, s) in enumerate(zip(per_fold_mean, per_fold_std), start=1):
+        print(f"  Fold {i}: mean={m:.4f}, std={s:.4f}")
+else:
+    print("\n[Per-fold difficulty across trials] No recorded fold_scores beyond the best trial.")
 
 # NOTE:
 # - This script *never* reads/evaluates fold 5.
