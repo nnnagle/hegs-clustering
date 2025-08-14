@@ -6,7 +6,7 @@ from sentence_transformers import SentenceTransformer, InputExample, losses, eva
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # -------------------------------------------------------------------
-# 1) Load R output and split by folds (train=1..4, val=5)
+# 1) Load R output and restrict to folds 1..4 ONLY (strictly ignore 5)
 # -------------------------------------------------------------------
 pairs_path = "data/interim/kw_pairs_with_folds.csv"   # from the R script
 if not os.path.isfile(pairs_path):
@@ -14,137 +14,108 @@ if not os.path.isfile(pairs_path):
 
 df_all = pd.read_csv(pairs_path)
 
-# Basic column checks
+# Required columns
 required = {"kw1", "kw2", "fold"}
 missing = required - set(df_all.columns)
 if missing:
     raise ValueError(f"Missing required columns in {pairs_path}: {missing}")
-
-# If your original data has a continuous label (e.g., similarity) keep it;
-# otherwise, fail fast so you don't silently train on garbage.
 if "value" not in df_all.columns:
     raise ValueError("Column 'value' not found. The R pipeline should preserve it from kw_pairs.csv.")
 
-# Clean bounds and NAs
+# Clean
 df_all = df_all.dropna(subset=["kw1", "kw2", "value"])
 df_all = df_all[(df_all["value"] >= 0.0) & (df_all["value"] <= 1.0)].reset_index(drop=True)
-
-# Enforce integer folds and filter to the ones we need
 df_all["fold"] = df_all["fold"].astype(int)
 
-train_df = df_all[df_all["fold"].isin([1, 2, 3, 4])].copy()
-val_df   = df_all[df_all["fold"] == 5].copy()
+# Only folds 1..4 for CV; do not even keep fold 5 in memory
+cv_folds = [1, 2, 3, 4]
+df_cv = df_all[df_all["fold"].isin(cv_folds)].copy()
+if df_cv.empty:
+    raise ValueError("No rows found for folds 1–4 to run CV.")
 
-if train_df.empty:
-    raise ValueError("No training rows found for folds 1–4.")
-if val_df.empty:
-    raise ValueError("No validation rows found for fold 5.")
+# Build per-fold data once to avoid recomputing inside trials
+def make_input_examples(df_subset: pd.DataFrame):
+    return [
+        InputExample(texts=[str(a), str(b)], label=float(v))
+        for a, b, v in df_subset[["kw1", "kw2", "value"]].itertuples(index=False, name=None)
+    ]
 
-# -------------------------------------------------------------------
-# 2) Build InputExamples and evaluator
-# -------------------------------------------------------------------
-train_examples = [
-    InputExample(texts=[str(a), str(b)], label=float(v))
-    for a, b, v in train_df[["kw1", "kw2", "value"]].itertuples(index=False, name=None)
-]
+fold_to_examples = {}
+fold_to_eval = {}
+for f in cv_folds:
+    val_df = df_cv[df_cv["fold"] == f]
+    train_df = df_cv[df_cv["fold"] != f]
+    if val_df.empty or train_df.empty:
+        raise ValueError(f"Fold {f}: train or val split is empty. Check your data balance.")
 
-val_evaluator = evaluation.EmbeddingSimilarityEvaluator(
-    sentences1=val_df["kw1"].astype(str).tolist(),
-    sentences2=val_df["kw2"].astype(str).tolist(),
-    scores=val_df["value"].astype(float).tolist(),
-    main_similarity=evaluation.SimilarityFunction.COSINE,
-)
-
-# -------------------------------------------------------------------
-# 3) Model + DataLoader + Loss
-# -------------------------------------------------------------------
-model = SentenceTransformer("all-mpnet-base-v2")
-train_dataloader = datasets.NoDuplicatesDataLoader(train_examples, batch_size=4)
-train_loss = losses.CosineSimilarityLoss(model)
-
-# -------------------------------------------------------------------
-# 4) Train (baseline run)
-# -------------------------------------------------------------------
-epochs = 3
-warmup_steps = int(0.1 * len(train_dataloader) * epochs)
-
-model.fit(
-    train_objectives=[(train_dataloader, train_loss)],
-    epochs=epochs,
-    warmup_steps=warmup_steps,
-    evaluator=val_evaluator,
-    evaluation_steps=max(50, len(train_dataloader) // 4),
-    output_path="finetuned_model",
-    show_progress_bar=True,
-    optimizer_params={"lr": 2e-5},
-    use_amp=True,
-)
+    fold_to_examples[f] = make_input_examples(train_df)
+    fold_to_eval[f] = evaluation.EmbeddingSimilarityEvaluator(
+        sentences1=val_df["kw1"].astype(str).tolist(),
+        sentences2=val_df["kw2"].astype(str).tolist(),
+        scores=val_df["value"].astype(float).tolist(),
+        main_similarity=evaluation.SimilarityFunction.COSINE,
+    )
 
 # -------------------------------------------------------------------
-# 5) Optuna hyperparam search (still evaluates on fold 5)
+# 2) Optuna: K-fold CV on folds 1..4
 # -------------------------------------------------------------------
-from itertools import product
 import torch
 torch.cuda.empty_cache()
 
 import optuna
-from sentence_transformers import SentenceTransformer, losses, datasets  # re-import safe
+from statistics import mean
+from sentence_transformers import SentenceTransformer, losses, datasets  # safe re-imports
 
 def objective(trial):
+    # Hyperparams to tune
     lr = trial.suggest_float("lr", 1e-5, 5e-5, log=True)
     warm = trial.suggest_float("warmup_frac", 0.05, 0.20)
     epochs = trial.suggest_int("epochs", 2, 5)
+    batch_size = trial.suggest_categorical("batch_size", [8, 16, 32])
 
-    model = SentenceTransformer("all-mpnet-base-v2")
-    model.max_seq_length = 64
-    train_loss = losses.CosineSimilarityLoss(model)
-    train_dl = datasets.NoDuplicatesDataLoader(train_examples, batch_size=16)
-    warmup_steps = int(warm * len(train_dl) * epochs)
+    fold_scores = []
+    for f in cv_folds:
+        # Fresh model per fold (no leakage)
+        model = SentenceTransformer("all-mpnet-base-v2")
+        model.max_seq_length = 64
 
-    model.fit(
-        train_objectives=[(train_dl, train_loss)],
-        epochs=epochs,
-        warmup_steps=warmup_steps,
-        show_progress_bar=False,
-        optimizer_params={"lr": lr},
-        use_amp=True,
-        evaluation_steps=max(50, len(train_dl) // 4),
-        evaluator=val_evaluator,
-    )
+        train_loss = losses.CosineSimilarityLoss(model)
+        train_dl = datasets.NoDuplicatesDataLoader(fold_to_examples[f], batch_size=batch_size)
 
-    scores = val_evaluator(model)
-    spearman = scores.get("spearman_cosine") or scores.get("cosine_spearman")
-    return spearman
+        # Warmup proportional to total steps for this fold
+        warmup_steps = int(warm * len(train_dl) * epochs)
+
+        model.fit(
+            train_objectives=[(train_dl, train_loss)],
+            epochs=epochs,
+            warmup_steps=warmup_steps,
+            show_progress_bar=False,
+            optimizer_params={"lr": lr},
+            use_amp=True,
+            evaluation_steps=max(50, len(train_dl) // 4),
+            evaluator=fold_to_eval[f],
+        )
+
+        scores = fold_to_eval[f](model)  # dict
+        spearman = scores.get("spearman_cosine") or scores.get("cosine_spearman")
+        if spearman is None:
+            raise RuntimeError("Evaluator did not return a Spearman score.")
+        fold_scores.append(spearman)
+
+        # Free VRAM between folds (especially important on small GPUs)
+        del model
+        torch.cuda.empty_cache()
+
+    # Return mean CV score across folds 1..4
+    return mean(fold_scores)
 
 study = optuna.create_study(direction="maximize")
 study.optimize(objective, n_trials=30)
-print(study.best_params, study.best_value)
 
-# -------------------------------------------------------------------
-# 6) Simple grid (optional) – still train on folds 1–4, validate on 5
-# -------------------------------------------------------------------
-epochs_list = [2, 3, 4]
-lr_list = [1e-5, 2e-5, 5e-5]
-warmup_frac_list = [0.05, 0.1, 0.2]
+print("Best params:", study.best_params)
+print("Best mean CV Spearman (folds 1–4):", study.best_value)
 
-results = []
-for epochs, lr, warmup_frac in product(epochs_list, lr_list, warmup_frac_list):
-    warmup_steps = int(warmup_frac * len(train_dataloader) * epochs)
-    model = SentenceTransformer("all-mpnet-base-v2")
-    train_loss = losses.CosineSimilarityLoss(model)
-    model.fit(
-        train_objectives=[(train_dataloader, train_loss)],
-        epochs=epochs,
-        warmup_steps=warmup_steps,
-        evaluator=val_evaluator,
-        evaluation_steps=max(50, len(train_dataloader) // 4),
-        show_progress_bar=False,
-        optimizer_params={"lr": lr},
-        use_amp=True,
-    )
-    score = val_evaluator(model).get("spearman_cosine")
-    results.append((epochs, lr, warmup_frac, score))
-    print(
-        f"\nEpochs: {epochs}, Learning Rate: {lr:.2e}, Warmup Fraction: {warmup_frac:.2f}, "
-        f"Validation Score (Spearman): {score:.4f}"
-    )
+# NOTE:
+# - This script *never* reads/evaluates fold 5.
+# - If you later want a final model, retrain on folds 1–4 with study.best_params,
+#   still without touching fold 5. (Keep fold 5 as a pristine holdout if desired.)
