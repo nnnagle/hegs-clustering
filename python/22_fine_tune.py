@@ -63,7 +63,7 @@ import torch
 torch.cuda.empty_cache()
 
 import optuna
-from statistics import mean
+from statistics import mean, pstdev
 from sentence_transformers import SentenceTransformer, losses, datasets  # safe re-imports
 
 def objective(trial):
@@ -96,15 +96,24 @@ def objective(trial):
             evaluator=fold_to_eval[f],
         )
 
-        scores = fold_to_eval[f](model)  # dict
-        spearman = scores.get("spearman_cosine") or scores.get("cosine_spearman")
-        if spearman is None:
-            raise RuntimeError("Evaluator did not return a Spearman score.")
+        # Evaluator may return a float (Spearman) or a dict depending on version.
+        eval_out = fold_to_eval[f](model)
+        if isinstance(eval_out, dict):
+            spearman = eval_out.get("spearman_cosine") or eval_out.get("cosine_spearman")
+            if spearman is None:
+                raise RuntimeError("Evaluator did not return a Spearman score.")
+        else:
+            spearman = float(eval_out)
+
         fold_scores.append(spearman)
 
         # Free VRAM between folds (especially important on small GPUs)
         del model
         torch.cuda.empty_cache()
+
+    # Attach per-fold stats to the trial for later inspection
+    trial.set_user_attr("fold_scores", fold_scores)
+    trial.set_user_attr("cv_std", pstdev(fold_scores) if len(fold_scores) > 1 else 0.0)
 
     # Return mean CV score across folds 1..4
     return mean(fold_scores)
@@ -114,6 +123,8 @@ study.optimize(objective, n_trials=30)
 
 print("Best params:", study.best_params)
 print("Best mean CV Spearman (folds 1–4):", study.best_value)
+print("Best trial per-fold:", study.best_trial.user_attrs.get("fold_scores"))
+print("Best trial CV std:", study.best_trial.user_attrs.get("cv_std"))
 
 # NOTE:
 # - This script *never* reads/evaluates fold 5.
