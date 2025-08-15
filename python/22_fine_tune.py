@@ -11,14 +11,17 @@
 #         * fold      (int; we will STRICTLY use folds 1..4)
 #         * value     (float in [0,1]; preserved from kw_pairs.csv)
 #
-# Outputs:
-#   - Console logs and Optuna study stats (best params, CV means/std)
-#   - No artifacts are written by default (pipeline-friendly).
+# Outputs (written under /model):
+#   - /model/sbert_final_folds1-4/           (SentenceTransformer save dir)
+#   - /model/best_params.json                (Optuna best hyperparameters)
+#   - /model/holdout_metrics.json            (Spearman, Pearson, MAE, RMSE, Bias)
+#   - /model/holdout_predictions.csv         (kw1, kw2, value, pred, error)
+#   - /model/holdout_deciles.csv             (calibration by true-label deciles)
+#   - Console logs and CV difficulty summary
 #
 # Notes:
-#   - Fold 5 is never read or evaluated (kept as pristine holdout).
-#   - Model backbone: sentence-transformers/all-mpnet-base-v2
 #   - CV metric: Spearman correlation on cosine similarity.
+#   - Fold 5 is kept pristine for final evaluation only.
 # ================================================================
 
 import os
@@ -45,6 +48,8 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MKL_NUM_THREADS", "4")
 # Make CUDA allocator less fragile (helps fragmentation on some GPUs).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# For stricter CUDA determinism in some GEMM paths
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 TORCH_THREADS = 1  # cap intraop threads
 try:
@@ -66,6 +71,11 @@ def ensure_file(path: str, purpose: str = "input"):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Missing {purpose}: {path}")
 
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    if not os.path.isdir(path):
+        raise RuntimeError(f"Unable to create directory: {path}")
+
 def check_required_columns(df: pd.DataFrame, req: set, where: str):
     missing = req - set(df.columns)
     if missing:
@@ -79,14 +89,43 @@ def assert_nonempty(df: pd.DataFrame, where: str):
 # ---------------------------- CONFIG ----------------------------
 # ================================================================
 IN_PAIRS_CSV = "data/interim/kw_pairs_with_folds.csv"   # from upstream R
-USE_FOLDS = [1, 2, 3, 4]                                # strictly ignore fold 5
+USE_FOLDS = [1, 2, 3, 4]                                # strictly ignore fold 5 during CV
+HOLDOUT_FOLD = 5
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 MAX_SEQ_LEN = 64
 N_TRIALS = 30                                           # Optuna trial count
 EVAL_SIM = evaluation.SimilarityFunction.COSINE
 
+SEED = 42                                               # <<< reproducibility seed
+MODEL_DIR = "models"                                    # <<< output root for artifacts
+FINAL_MODEL_SUBDIR = "sbert_final_folds1-4"
+CHECKPOINTS_DIR = "models/checkpoints"
+
 # Tokenizer threshold for diagnostics
 LONG_PAIR_THRESH = 12  # total subword tokens across kw1+kw2
+
+# ================================================================
+# ------------------------ Reproducibility -----------------------
+# ================================================================
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+# Deterministic kernels (slower but steadier)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+# Avoid TF32 drift on Ampere+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+# Be strict where possible; warn if an op lacks a deterministic impl
+try:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+except Exception:
+    pass
+
+log("Reproducibility seed: %d", SEED)
 
 # ================================================================
 # --------------------------- LOAD DATA --------------------------
@@ -220,6 +259,7 @@ log("Prepared per-fold train/eval objects for folds: %s", USE_FOLDS)
 # ================================================================
 # --------------------- OPTUNA: K-FOLD CV ------------------------
 # ================================================================
+ensure_dir(CHECKPOINTS_DIR)
 torch.cuda.empty_cache()
 
 def objective(trial: optuna.Trial) -> float:
@@ -236,7 +276,13 @@ def objective(trial: optuna.Trial) -> float:
         model.max_seq_length = MAX_SEQ_LEN
 
         train_loss = losses.CosineSimilarityLoss(model)
-        train_dl = datasets.NoDuplicatesDataLoader(fold_to_examples[f], batch_size=batch_size)
+
+        # Seeded DataLoader for stable shuffling (fallback if generator unsupported)
+        g = torch.Generator().manual_seed(SEED + f)
+        try:
+            train_dl = datasets.NoDuplicatesDataLoader(fold_to_examples[f], batch_size=batch_size, generator=g)
+        except TypeError:
+            train_dl = datasets.NoDuplicatesDataLoader(fold_to_examples[f], batch_size=batch_size)
 
         # Warmup proportional to total steps for this fold
         warmup_steps = int(warm * len(train_dl) * epochs)
@@ -247,9 +293,12 @@ def objective(trial: optuna.Trial) -> float:
             warmup_steps=warmup_steps,
             show_progress_bar=False,
             optimizer_params={"lr": lr},
-            use_amp=True,
-            evaluation_steps=max(50, len(train_dl) // 4),
+            use_amp=True,                 # flip to False for stricter determinism
+            evaluation_steps=None,        # epoch-end only
             evaluator=fold_to_eval[f],
+            checkpoint_path=CHECKPOINTS_DIR,            # ← disable
+            checkpoint_save_steps=2000,      # ← disable
+            checkpoint_save_total_limit=3 # ← disable
         )
 
         # Evaluator returns a float (Spearman) or a dict depending on version.
@@ -263,7 +312,7 @@ def objective(trial: optuna.Trial) -> float:
 
         fold_scores.append(spearman)
 
-        # Free VRAM between folds (important on small GPUs)
+        # Free VRAM between folds
         del model
         torch.cuda.empty_cache()
 
@@ -273,8 +322,10 @@ def objective(trial: optuna.Trial) -> float:
 
     return mean(fold_scores)
 
-log("Starting Optuna study (trials=%d)...", N_TRIALS)
-study = optuna.create_study(direction="maximize")
+# Seeded sampler so trial sequence is reproducible
+sampler = optuna.samplers.TPESampler(seed=SEED)
+log("Starting Optuna study (trials=%d, seed=%d)...", N_TRIALS, SEED)
+study = optuna.create_study(direction="maximize", sampler=sampler)
 study.optimize(objective, n_trials=N_TRIALS)
 
 log("Best params: %s", study.best_params)
@@ -286,14 +337,158 @@ log("Best trial CV std: %s", study.best_trial.user_attrs.get("cv_std"))
 fold_mat = np.array([t.user_attrs["fold_scores"] for t in study.trials if "fold_scores" in t.user_attrs])
 if fold_mat.size:
     per_fold_mean = fold_mat.mean(0)
-    per_fold_std = fold_mat.std(0, ddof=0)
+    per_fold_std  = fold_mat.std(0, ddof=0)
     log("[Per-fold difficulty across all trials]")
     for i, (m, s) in enumerate(zip(per_fold_mean, per_fold_std), start=1):
         log("  Fold %d: mean=%.4f, std=%.4f", i, m, s)
 else:
     log("[Per-fold difficulty across trials] No recorded fold_scores beyond the best trial.")
 
+# Persist best params immediately
+ensure_dir(MODEL_DIR)
+best_params_path = os.path.join(MODEL_DIR, "best_params.json")
+with open(best_params_path, "w") as f:
+    json.dump(study.best_params, f, indent=2)
+log("Wrote best params: %s", best_params_path)
+
+# ================================================================
+# ------ FINAL TRAIN (FOLDS 1–4) & HOLDOUT (FOLD 5) EVALUATION ---
+# ================================================================
+df_hold = df_all[df_all["fold"] == HOLDOUT_FOLD].copy()
+assert_nonempty(df_hold, f"Holdout fold {HOLDOUT_FOLD}")
+
+log("Final training on folds %s with best params, then evaluating on holdout fold %d.",
+    USE_FOLDS, HOLDOUT_FOLD)
+
+best = study.best_params
+lr      = float(best["lr"])
+warm    = float(best["warmup_frac"])
+epochs  = int(best["epochs"])
+bs      = int(best["batch_size"])
+
+# Build full training set from folds 1–4
+final_examples = make_input_examples(df_cv)
+
+g_final = torch.Generator().manual_seed(SEED + 999)
+try:
+    final_dl = datasets.NoDuplicatesDataLoader(final_examples, batch_size=bs, generator=g_final)
+except TypeError:
+    final_dl = datasets.NoDuplicatesDataLoader(final_examples, batch_size=bs)
+
+# Fresh model
+final_model = SentenceTransformer(MODEL_NAME)
+final_model.max_seq_length = MAX_SEQ_LEN
+
+final_train_loss = losses.CosineSimilarityLoss(final_model)
+final_warmup_steps = int(warm * len(final_dl) * epochs)
+
+log("Final fit: epochs=%d, batch_size=%d, lr=%.2e, warmup_frac=%.2f (steps=%d).",
+    epochs, bs, lr, warm, final_warmup_steps)
+
+final_model.fit(
+    train_objectives=[(final_dl, final_train_loss)],
+    epochs=epochs,
+    warmup_steps=final_warmup_steps,
+    show_progress_bar=False,
+    optimizer_params={"lr": lr},
+    use_amp=True,             # set False for stricter determinism
+    evaluation_steps=None,    # no mid-epoch noise
+    evaluator=None,           # evaluate after training
+    checkpoint_path=CHECKPOINTS_DIR,            # ← disable
+    checkpoint_save_steps=2000,      # ← disable
+    checkpoint_save_total_limit=3 # ← disable
+)
+
+# --- Save final model ---
+final_model_dir = os.path.join(MODEL_DIR, FINAL_MODEL_SUBDIR)
+ensure_dir(final_model_dir)
+final_model.save(final_model_dir)
+log("Saved final SentenceTransformer to: %s", final_model_dir)
+
+# --- Holdout predictions (cosine similarity) ---
+kw1_list = df_hold["kw1"].astype(str).tolist()
+kw2_list = df_hold["kw2"].astype(str).tolist()
+y_true   = df_hold["value"].astype(float).to_numpy()
+
+# Encode with normalization so dot == cosine
+emb1 = final_model.encode(kw1_list, batch_size=max(64, bs), convert_to_numpy=True, normalize_embeddings=True)
+emb2 = final_model.encode(kw2_list, batch_size=max(64, bs), convert_to_numpy=True, normalize_embeddings=True)
+y_pred = np.sum(emb1 * emb2, axis=1).astype(float)
+
+# --- Error statistics ---
+def _spearman_np(a: np.ndarray, b: np.ndarray) -> float:
+    ra = pd.Series(a).rank(method="average")
+    rb = pd.Series(b).rank(method="average")
+    c = np.corrcoef(ra, rb)
+    return float(c[0, 1]) if c.shape == (2, 2) else float("nan")
+
+def _pearson_np(a: np.ndarray, b: np.ndarray) -> float:
+    c = np.corrcoef(a, b)
+    return float(c[0, 1]) if c.shape == (2, 2) else float("nan")
+
+err   = y_pred - y_true
+mae   = float(np.mean(np.abs(err)))
+rmse  = float(np.sqrt(np.mean(err ** 2)))
+bias  = float(np.mean(err))
+spr   = _spearman_np(y_pred, y_true)
+pr    = _pearson_np(y_pred, y_true)
+
+log("[HOLDOUT fold %d] n=%d  Spearman=%.6f  Pearson=%.6f  MAE=%.6f  RMSE=%.6f  Bias=%.6f",
+    HOLDOUT_FOLD, len(y_true), spr, pr, mae, rmse, bias)
+
+# --- Save metrics & predictions ---
+metrics = {
+    "seed": SEED,
+    "model_name": MODEL_NAME,
+    "max_seq_len": MAX_SEQ_LEN,
+    "best_params": study.best_params,
+    "cv_best_mean_spearman": study.best_value,
+    "holdout_fold": HOLDOUT_FOLD,
+    "n_holdout": int(len(y_true)),
+    "spearman": spr,
+    "pearson": pr,
+    "mae": mae,
+    "rmse": rmse,
+    "bias": bias,
+    "timestamp": timestamp(),
+}
+metrics_path = os.path.join(MODEL_DIR, "holdout_metrics.json")
+with open(metrics_path, "w") as f:
+    json.dump(metrics, f, indent=2)
+log("Wrote holdout metrics: %s", metrics_path)
+
+pred_df = pd.DataFrame({
+    "kw1": kw1_list,
+    "kw2": kw2_list,
+    "value": y_true,
+    "pred": y_pred,
+    "error": err,
+})
+pred_path = os.path.join(MODEL_DIR, "holdout_predictions.csv")
+pred_df.to_csv(pred_path, index=False)
+log("Wrote holdout predictions: %s", pred_path)
+
+# Optional: quick calibration glance (bin by true label) + save
+try:
+    calib = pred_df.copy()
+    calib["bin"] = pd.qcut(calib["value"], q=10, duplicates="drop")
+    by_bin = calib.groupby("bin").agg(
+        n=("value", "size"),
+        true_mean=("value", "mean"),
+        pred_mean=("pred", "mean"),
+        mae=("pred", lambda s: float(np.mean(np.abs(s - calib.loc[s.index, "value"])))),
+    ).reset_index()
+    deciles_path = os.path.join(MODEL_DIR, "holdout_deciles.csv")
+    by_bin.to_csv(deciles_path, index=False)
+    log("Wrote holdout deciles table: %s", deciles_path)
+except Exception:
+    log("Skipped decile calibration table (insufficient variety or binning error).")
+
+# Clean up GPU memory
+del final_model
+torch.cuda.empty_cache()
+
 # ------------------------------- END ------------------------------
-# - This script never reads/evaluates fold 5.
-# - For a final model: retrain on folds 1–4 using study.best_params,
-#   still without touching fold 5 (hold it out for a true final check).
+# - CV search uses folds 1–4 only.
+# - Final model is trained on folds 1–4 with best params.
+# - Holdout metrics reported on fold 5 and artifacts written under /model.
