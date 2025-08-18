@@ -81,6 +81,18 @@ ensure_dir <- function(path) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
 }
 
+fix_hyphenation <- function(x) {
+  x |>
+    str_replace_all("\u00AD", "") |>  # remove soft hyphen chars if present
+    # join words split by a hyphen at a line break (letters on both sides)
+    str_replace_all("(?<=\\p{L})-\\s*\\r?\\n\\s*(?=\\p{L})", "") |>
+    # if your line breaks were turned into long runs of spaces, also fix those:
+    str_replace_all("(?<=\\p{L})-\\s{2,}(?=\\p{L})", "") |>
+    # flatten remaining newlines to spaces and squish
+    str_replace_all("[\\r\\n]+", " ") |>
+    str_squish()
+}
+
 ## =============================
 ## LOAD & VALIDATE INPUT
 ## =============================
@@ -116,6 +128,7 @@ df <- raw_df %>%
       # remove statutory boilerplate
       str_replace(statutory_text[1], " ") %>%
       str_replace(statutory_text[2], " ") %>%
+      fix_hyphenation() %>%
       # pad parens and collapse newlines
       str_replace_all("\\)", " ) ") %>%
       str_replace_all("\\(", " ( ") %>%
