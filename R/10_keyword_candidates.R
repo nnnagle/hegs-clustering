@@ -53,8 +53,8 @@ suppressPackageStartupMessages({
 input_file   <- "data/interim/HEGS_clean_df.csv"
 out_dir      <- "data/interim"
 out_file    <- file.path(out_dir, "keyword_candidates.csv")
-db_path <- "data/interim/keywords.sqlite"
-db <- dbConnect(SQLite(), db_path)
+db_path <- "data/interim/keyword_candidates.sqlite"
+
 
 # Phrase frequency threshold (minimum # of distinct award_ids)
 min_doc_count <- 5L
@@ -91,6 +91,38 @@ trim_term <- function(term, stopwords_vec) {
 ## =============================
 ## LOAD INPUT & VALIDATE
 ## =============================
+
+# Ensure the directory exists before connecting
+ensure_dir(dirname(db_path))
+# Open connection
+db <- dbConnect(SQLite(), db_path)
+# Always checkpoint + disconnect, even if errors occur later
+on.exit({
+  # best-effort checkpoint & cleanup; ignore failures
+  try(dbExecute(db, "PRAGMA wal_checkpoint(TRUNCATE);"), silent = TRUE)
+  try(dbDisconnect(db), silent = TRUE)
+}, add = TRUE)
+# Pragmas for a single-writer local file
+invisible(dbExecute(db, "PRAGMA journal_mode=WAL;"))
+invisible(dbExecute(db, "PRAGMA synchronous=NORMAL;"))
+invisible(dbExecute(db, "PRAGMA foreign_keys=ON;"))
+
+# Ensure schema once
+invisible(dbExecute(db, "DROP TABLE IF EXISTS keyword_candidates;"))
+invisible(dbExecute(db, "
+CREATE TABLE IF NOT EXISTS keyword_candidates (
+  kid TEXT PRIMARY KEY,
+  phrase TEXT,
+  award_ids TEXT,
+  n TEXT,
+  omit INTEGER CHECK (omit IN (0,1)),
+  method INTEGER CHECK (method IN (0,1)),
+  thematic INTEGER CHECK (thematic IN (0,1))
+);
+"))
+invisible(dbExecute(db, "CREATE INDEX IF NOT EXISTS idx_keyword_phrase ON keyword_candidates(phrase);"))
+
+
 
 if (!file.exists(input_file)) stop(sprintf("Input not found: %s", input_file))
 ensure_dir(out_dir)
@@ -285,19 +317,6 @@ quiet_dbExecute <- function(conn, sql) invisible(DBI::dbExecute(conn, sql))
 quiet_dbExecute(db, "PRAGMA journal_mode=WAL;")
 quiet_dbExecute(db, "PRAGMA synchronous=NORMAL;")
 
-# Ensure table exists once (schema matches your CSV output)
-quiet_dbExecute(db, "
-CREATE TABLE IF NOT EXISTS keyword_candidates (
-  kid TEXT PRIMARY KEY,
-  phrase TEXT,
-  award_ids TEXT,      -- comma string, same as CSV
-  omit INTEGER CHECK (omit IN (0,1)),
-  method INTEGER CHECK (method IN (0,1)),
-  thematic INTEGER CHECK(thematic IN (0,1))
-);
-")
-quiet_dbExecute(db, "CREATE INDEX IF NOT EXISTS idx_keyword_phrase ON keyword_candidates(phrase);")
-
 
 keyword_candidates <- full_join(colloc_phrases, noun_phrases, by='phrase') %>%
   mutate(
@@ -334,6 +353,7 @@ ensure_dir(out_dir)
 keyword_candidates_out <- keyword_candidates %>%
   mutate(
     award_ids = vapply(award_ids, function(x) paste(x, collapse = ","), character(1)),
+    n = vapply(n, function(x) paste(x, collapse=","), character(1)),
     omit      = ifelse(is.na(omit), FALSE, omit),
     method    = ifelse(is.na(method), FALSE, method),
     thematic  = ifelse(is.na(thematic), FALSE, thematic)
@@ -344,7 +364,7 @@ keyword_candidates_out <- keyword_candidates %>%
     method   = as.integer(method),
     thematic = as.integer(thematic)
   ) %>%
-  select(kid, phrase, award_ids, omit, method, thematic)
+  select(kid, phrase, award_ids, n, omit, method, thematic)
 
 # Write CSV (default quote='needed' is smaller & faster)
 logi("Writing: %s", out_file)
@@ -352,12 +372,20 @@ readr::write_csv(keyword_candidates_out, out_file)
 
 # Mirror into SQLite (single transactional replace)
 logi("Writing: %s", db_path)
+tryCatch({
+  dbBegin(db)
+  dbExecute(db, "DELETE FROM keyword_candidates;")
+  dbAppendTable(db, "keyword_candidates", keyword_candidates_out)  # safe append
+  dbCommit(db)
+}, error = function(e) {
+  try(dbRollback(db), silent = TRUE)
+  stop(sprintf("SQLite write failed: %s", e$message))
+})
 invisible(dbWithTransaction(db, {
   # overwrite table contents atomically
   dbExecute(db, "DELETE FROM keyword_candidates;")
   dbWriteTable(db, "keyword_candidates", keyword_candidates_out, append = TRUE)
 }))
-
-
+invisible(DBI::dbExecute(db, "PRAGMA wal_checkpoint(TRUNCATE);"))
 logi("Done.")
 
