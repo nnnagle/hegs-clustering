@@ -42,6 +42,8 @@ lambda_bins  <- 1.0        # weight of score-balance term in packing objective
 giant_min_nodes <- 50     # split components with >= this many nodes
 giant_min_edges <- 100     # OR with >= this many edges
 
+symmetrize_after_split <- TRUE  # if TRUE, duplicate kept edges as (kw2, kw1)
+
 seed       <- 42           # random seed for reproducibility
 verbose    <- TRUE         # print logs?
 
@@ -52,8 +54,8 @@ out_kw_csv      <- file.path(out_dir, "kw_split_keywords.csv")
 out_summary_csv <- file.path(out_dir, "kw_split_summary.csv")
 
 ## ---------------- Utilities ----------------
-timestamp <- function() format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-logi <- function(...) if (verbose) cat(sprintf("[%s] ", timestamp()), sprintf(...), "\n")
+
+source('R/proj_utilities.R')
 fail <- function(msg, ...) stop(sprintf(msg, ...), call. = FALSE)
 nz <- function(x) ifelse(is.finite(x) & x != 0, x, 1)
 
@@ -68,9 +70,7 @@ if (!file.exists(in_pairs_csv)) fail("Missing input: %s", in_pairs_csv)
 logi("Reading keyword pairs: %s", in_pairs_csv)
 df_raw <- read_csv(in_pairs_csv, show_col_types = FALSE)
 
-req_cols <- c("kw1", "kw2")
-miss <- setdiff(req_cols, names(df_raw))
-if (length(miss)) fail("Input missing columns: %s", paste(miss, collapse = ", "))
+require_cols(df_raw, cols=c('kw1','kw2'), 'df_raw')
 
 df <- df_raw %>%
   mutate(kw1 = as.character(kw1), kw2 = as.character(kw2)) %>%
@@ -94,6 +94,8 @@ if (!is.null(score_col)) {
   if (!(score_col %in% names(df))) fail("Requested score_col '%s' not found.", score_col)
   if (!is.numeric(df[[score_col]])) fail("score_col '%s' must be numeric.", score_col)
 }
+
+logi('Building graph with %s edges', nrow(df))
 
 ## ---------------- Graph & components ----------------
 g <- graph_from_data_frame(df[, c("kw1", "kw2")], directed = FALSE)
@@ -386,6 +388,19 @@ pairs_with_fold <- df_with_folds %>%
   filter(fold1 == fold2) %>%
   transmute(kw1, kw2, !!!syms(extra_cols), fold = fold1)
 
+# ---- Optional symmetrization *after* splits ----
+pairs_with_fold_sym <- pairs_with_fold
+if (isTRUE(symmetrize_after_split)) {
+  flipped <- pairs_with_fold %>%
+    transmute(
+      kw1 = kw2,
+      kw2 = kw1,
+      !!!syms(extra_cols),   # preserve all extra columns as-is
+      fold = fold            # same fold; we split on nodes, not direction
+    )
+  pairs_with_fold_sym <- bind_rows(pairs_with_fold, flipped)
+}
+
 ## ---------------- Outputs ----------------
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -406,7 +421,7 @@ write_csv(
 )
 
 write_csv(kw_assign %>% select(keyword, fold), out_kw_csv)
-write_csv(pairs_with_fold, out_pairs_csv)
+write_csv(pairs_with_fold_sym, out_pairs_csv)
 
 summary_tbl <- pairs_with_fold %>%
   count(fold, name = "n_edges") %>%
@@ -427,6 +442,9 @@ logi("Fold weights: %s", paste(summary_tbl$weight, collapse = ", "))
 logi("Fold kept-edge counts: %s", paste(summary_tbl$n_edges, collapse = ", "))
 logi("Cross-fold edges dropped: %d of %d (cut ratio = %.2f%%).",
      n_cross_fold, nrow(df_with_folds), 100 * cut_ratio)
+if (isTRUE(symmetrize_after_split)) {
+  logi("Symmetrized output written: %s (rows doubled per kept edge).", out_pairs_csv)
+}
 logi("Wrote:\n  - %s\n  - %s\n  - %s\n  - %s",
      out_pairs_csv, out_comp_csv, out_kw_csv, out_summary_csv)
 logi("Done.")

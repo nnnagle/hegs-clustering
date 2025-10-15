@@ -12,3 +12,5 @@ require_cols <- function(df, cols, where) {
 }
 
 as_chr <- function(x) as.character(replace(x, is.na(x), ""))
+
+fail <- function(msg, ...) stop(sprintf(msg, ...), call. = FALSE)
